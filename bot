@@ -1,0 +1,591 @@
+import pyautogui
+import pygetwindow as gw
+import config
+from telethon import TelegramClient, events, utils
+from datetime import datetime, timedelta
+import time
+import re
+import logging
+import pytesseract
+from PIL import Image, ImageGrab
+import cv2
+import threading
+import queue
+import subprocess
+import os
+from pywinauto import Application
+import win32gui
+import win32con
+import numpy as np
+
+# --- Configurações da API do Telegram ---
+API_ID = config.API_ID
+API_HASH = config.API_HASH
+PHONE_NUMBER = config.PHONE_NUMBER
+TELEGRAM_SESSION_NAME = 'my_telegram_session'
+MAX_TELEGRAM_RETRIES = 3
+RETRY_TELEGRAM_DELAY = 5
+
+# --- Configurações do AvalonBroker ---
+AVALON_EXECUTABLE_PATH = os.path.join(r"C:\Program Files (x86)\Avalon", "AvalonBroker.exe")
+AVALON_WINDOW_TITLE = "Avalon"
+
+# --- ID do Grupo ---
+GRUPO_ALVO_ID = config.GRUPO_ALVO_ID
+
+# --- Caminho para o executável do Tesseract OCR ---
+TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# --- Coordenadas e Elementos da Interface ---
+COORD_BARRA_BUSCA = (194, 148)
+COORD_ATIVO = (526, 298)
+COORD_SELETOR_TEMPO = (1831, 229)
+COORD_5_MINUTOS = (1652, 664)
+COORD_COMPRAR = (1842, 445)
+COORD_VENDER = (1835, 511)
+COORD_BANCA = (1448, 31, 1623, 119)
+COORD_OPEN_POSITIONS = (1023, 773, 1381, 844)  # (left, top, right, bottom)
+COORD_EXPIRATION_TIMER = (544, 797, 623, 829)  # (left, top, right, bottom)
+
+# --- Configuração de logging ---
+logging.basicConfig(filename='app.log', filemode='w',
+                    format='%(asctime)s - %(name)s - %(funcName)s - %(levelname)s - %(message)s',
+                    level=logging.INFO)
+
+# --- Global Variables ---
+avalon_window = None
+
+# --- Cria o cliente do Telegram ---
+client = TelegramClient(TELEGRAM_SESSION_NAME, API_ID, API_HASH)
+
+# --- Funções Auxiliares ---
+
+def iniciar_avalon():
+    """Inicia o aplicativo da Avalon se ele não estiver aberto."""
+    global avalon_window
+    try:
+        avalon_window = gw.getWindowsWithTitle(AVALON_WINDOW_TITLE)[0]
+        print("Aplicativo da Avalon já está aberto.")
+        logging.info("Aplicativo da Avalon já está aberto.")
+    except IndexError:
+        print("Iniciando o aplicativo da Avalon...")
+        logging.info("Iniciando o aplicativo da Avalon...")
+        subprocess.Popen(AVALON_EXECUTABLE_PATH)
+        time.sleep(10)
+        avalon_window = gw.getWindowsWithTitle(AVALON_WINDOW_TITLE)[0]
+        print("Aplicativo da Avalon iniciado.")
+        logging.info("Aplicativo da Avalon iniciado.")
+
+
+def ativar_janela_avalon():
+    """Ativa e maximiza a janela do aplicativo da Avalon."""
+    global avalon_window
+    try:
+        if avalon_window:
+            if avalon_window.isMinimized:
+                print("Restaurando a janela da Avalon...")
+                logging.info("Restaurando a janela da Avalon...")
+                avalon_window.restore()
+
+            print("Ativando e maximizando a janela da Avalon com pywinauto...")
+            logging.info("Ativando e maximizando a janela da Avalon com pywinauto...")
+            app = Application().connect(handle=avalon_window._hWnd)
+            app_window = app.top_window()
+            app_window.set_focus()
+
+            if not avalon_window.isMaximized:
+                print("Maximizando a janela da Avalon...")
+                logging.info("Maximizando a janela da Avalon...")
+                avalon_window.maximize()
+
+            print("Forçando a janela da Avalon para o primeiro plano com win32gui...")
+            logging.info("Forçando a janela da Avalon para o primeiro plano com win32gui...")
+            hwnd = avalon_window._hWnd
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+            win32gui.SetForegroundWindow(hwnd)
+
+            print("Janela da Avalon ativada, restaurada e maximizada.")
+            logging.info("Janela da Avalon ativada, restaurada e maximizada.")
+        else:
+            print("Referência para a janela da Avalon não encontrada.")
+            logging.warning("Referência para a janela da Avalon não encontrada.")
+            iniciar_avalon()
+
+    except Exception as e:
+        print(f"Um erro ocorreu: {e}")
+        logging.error(f"Um erro ocorreu: {e}")
+        iniciar_avalon()
+
+# --- Funções auxiliares para processar mensagens ---
+def extrair_informacoes(mensagem):
+    """Extrai informações do ativo, ação e tempos da mensagem."""
+    padrao = r"⚠️TRADE RÁPIDO⚠️\s+([\s\S]+?)\s*\(Até 5min\)-> 5 MINUTOS\s*🕐Entrar (\w+) em (\d{2}:\d{2})🔽?\s*1ª REENTRADA —> (\d{2}:\d{2})\s*2ª REENTRADA —> (\d{2}:\d{2})"
+    correspondencia = re.search(padrao, mensagem)
+
+    if correspondencia:
+        ativo = correspondencia.group(1).strip()
+        acao = correspondencia.group(2).upper()
+        hora_entrada = correspondencia.group(3)
+        hora_reentrada1 = correspondencia.group(4)
+        hora_reentrada2 = correspondencia.group(5)
+        return ativo, acao, hora_entrada, hora_reentrada1, hora_reentrada2
+    else:
+        logging.warning("Não foi possível extrair as informações da mensagem.")
+        return None, None, None, None, None
+
+def calcular_tempos(hora_entrada, hora_reentrada1, hora_reentrada2):
+    """Calcula os objetos datetime para entrada e reentradas."""
+    agora = datetime.now()
+    hora_entrada_dt = datetime.strptime(hora_entrada, "%H:%M").time()
+    hora_reentrada1_dt = datetime.strptime(hora_reentrada1, "%H:%M").time()
+    hora_reentrada2_dt = datetime.strptime(hora_reentrada2, "%H:%M").time()
+    entrada_dt = datetime.combine(agora.date(), hora_entrada_dt)
+    reentrada1_dt = datetime.combine(agora.date(), hora_reentrada1_dt)
+    reentrada2_dt = datetime.combine(agora.date(), hora_reentrada2_dt)
+
+    return entrada_dt, reentrada1_dt, reentrada2_dt
+
+def obter_valor_banca():
+    """
+    Obtém o valor atual da banca na plataforma usando um screenshot da tela inteira e OCR.
+    """
+    try:
+        # Captura a tela inteira
+        screenshot = pyautogui.screenshot()
+        screenshot.save("fullscreen_screenshot.png")
+
+        # Carrega a imagem com OpenCV
+        img = cv2.imread("fullscreen_screenshot.png")
+
+        # Corta a região da banca
+        img_banca = img[COORD_BANCA[1]:COORD_BANCA[3], COORD_BANCA[0]:COORD_BANCA[2]]
+        cv2.imwrite("banca_screenshot.png", img_banca)
+
+        # Converte para escala de cinza
+        gray = cv2.cvtColor(img_banca, cv2.COLOR_BGR2GRAY)
+
+        # Aplica thresholding
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+        # OCR
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+        valor_banca_str = pytesseract.image_to_string(thresh, config='--psm 6').strip()
+
+        # Remove caracteres não numéricos, exceto o ponto decimal
+        valor_banca_str = re.sub(r"[^\d\-+\.]", "", valor_banca_str)
+
+        # Converte para float
+        valor_banca = float(valor_banca_str)
+        print(f"Valor da banca obtido: {valor_banca}")
+        logging.info(f"Valor da banca obtido: {valor_banca}")
+        return valor_banca
+    except Exception as e:
+        print(f"Erro ao obter valor da banca: {e}")
+        logging.error(f"Erro ao obter valor da banca: {e}")
+        return None
+
+# --- Funções para captura e processamento da imagem da tabela de posições ---
+
+def obter_regiao_posicao_atual():
+    """
+    Captura um screenshot da tela cheia, recorta a região da tabela de posições abertas e a amplia.
+    Salva as imagens para depuração.
+    """
+    try:
+        # Capturar screenshot da tela inteira
+        screenshot = pyautogui.screenshot()
+        screenshot.save("fullscreen_screenshot.png") # Salva a captura de tela para depuração
+
+        # Carrega a imagem com OpenCV
+        img = cv2.imread("fullscreen_screenshot.png")
+
+        # Definir as coordenadas da região da tabela de posições abertas
+        x1, y1, x2, y2 = COORD_OPEN_POSITIONS
+
+        # Recortar a região da imagem
+        regiao = img[y1:y2, x1:x2]
+
+        # Salvar a imagem cortada para depuração
+        cv2.imwrite("regiao_posicao_atual_cortada.png", regiao)
+        #print("Imagem da região cortada salva como 'regiao_posicao_atual_cortada.png'")
+
+        # Fator de escala para redimensionamento (4x)
+        fator_escala = 4
+
+        # Redimensionando a imagem cortada
+        imagem_redimensionada = cv2.resize(
+            regiao, None, fx=fator_escala, fy=fator_escala, interpolation=cv2.INTER_LINEAR
+        )
+
+        # Salvar a imagem ampliada para inspeção
+        cv2.imwrite("imagem4x.png", imagem_redimensionada)
+        #print("Imagem redimensionada salva como 'imagem4x.png'")
+
+        return imagem_redimensionada
+
+    except Exception as e:
+        print(f"Erro ao capturar e recortar a região da posição atual: {e}")
+        logging.error(f"Erro ao capturar e recortar a região da posição atual: {e}")
+        return None
+
+def extrair_posicao_atual(imagem_ampliada):
+    """
+    Extrai a informação de 'Open' e 'Current Price' da imagem ampliada da tabela de posições abertas.
+    Retorna um dicionário com os valores de 'Open' e 'Current Price'.
+    """
+    try:
+        # Converter a imagem ampliada para escala de cinza
+        gray = cv2.cvtColor(imagem_ampliada, cv2.COLOR_BGR2GRAY)
+
+        # Aplica thresholding (método do código que lê a banca)
+        thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+        # Salvar a imagem processada para depuração
+        cv2.imwrite("imagem_processada.png", thresh)
+        #print("Imagem processada salva como 'imagem_processada.png'")
+
+        # Extrair texto da imagem com pytesseract (configuração do código que lê a banca)
+        custom_config = r'--psm 6'  # PSM 6 (igual ao código da banca)
+        texto = pytesseract.image_to_string(thresh, config=custom_config)
+        #print(f"Texto extraído: {texto}")
+
+        # Usar expressões regulares para encontrar os dois números
+        numeros = re.findall(r"[\d\.]+", texto)
+
+        if len(numeros) == 2:
+            # Remover pontos que separam milhares (se houver)
+            numeros[0] = numeros[0].replace('.', '')
+            numeros[1] = numeros[1].replace('.', '')
+
+            # Adicionar ponto decimal antes dos 5 ultimos digitos
+            numeros[0] = numeros[0][:-5] + '.' + numeros[0][-5:]
+            numeros[1] = numeros[1][:-5] + '.' + numeros[1][-5:]
+
+            open_value = float(numeros[0])
+            current_value = float(numeros[1])
+            return {"Open": open_value, "Current Price": current_value}
+
+        else:
+            print("Não foi possível extrair os dois valores numéricos.")
+            return None
+
+    except Exception as e:
+        print(f"Erro ao extrair informações da posição atual: {e}")
+        return None
+
+# --- Funções para o contador Expiration ---
+
+def take_region_screenshot(x, y, width, height):
+    """Captura um screenshot da região especificada."""
+    screenshot = pyautogui.screenshot(region=(x, y, width, height))
+    return cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+
+def ampliar_imagem(imagem, fator_escala):
+    """Amplia a imagem usando cv2.resize."""
+    return cv2.resize(imagem, None, fx=fator_escala, fy=fator_escala, interpolation=cv2.INTER_LINEAR)
+
+def ler_tempo_com_ocr(imagem):
+    """Lê o tempo da imagem usando Tesseract OCR."""
+    # Amplia a imagem
+    imagem_ampliada = ampliar_imagem(imagem, 4)
+
+    # Converte para escala de cinza
+    gray = cv2.cvtColor(imagem_ampliada, cv2.COLOR_BGR2GRAY)
+
+    # Aplica thresholding
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+
+    # Configuração do Tesseract
+    custom_config = r'--psm 6'
+
+    # OCR
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+    texto = pytesseract.image_to_string(thresh, config=custom_config)
+
+    # Remover espaço em branco e dois pontos
+    texto = texto.strip().replace(":", "")
+
+    return texto
+
+# --- Execução de Trade ---
+def executar_acao_trade(acao, ativo, reentrada=False):
+    """Executa os passos para realizar a ação de trade na plataforma."""
+    ativar_janela_avalon()
+
+    print("Clicando para abrir a barra de busca...")
+    pyautogui.click(x=COORD_BARRA_BUSCA[0], y=COORD_BARRA_BUSCA[1])
+    print("Clique realizado.")
+    pyautogui.screenshot('barra_busca.png')
+
+    print(f"Digitando o nome do ativo: {ativo}")
+    pyautogui.write(ativo)
+    print("Ativo digitado.")
+    pyautogui.screenshot('ativo_digitado.png')
+
+    print("Selecionando o ativo na lista...")
+    pyautogui.click(x=COORD_ATIVO[0], y=COORD_ATIVO[1])
+    print("Clique realizado.")
+    pyautogui.screenshot('ativo_selecionado.png')
+
+    print("Aguardando 2.5 segundos para a página do ativo carregar...")
+    time.sleep(2.5)  # Ajustado para 2.5 segundos
+    print("Tempo de espera concluído.")
+
+    print("Abrindo o seletor de tempo de expiração...")
+    pyautogui.click(x=COORD_SELETOR_TEMPO[0], y=COORD_SELETOR_TEMPO[1])
+    print("Clique realizado.")
+    pyautogui.screenshot('seletor_tempo.png')
+
+    print("Aguardando 0.5 segundo antes de clicar em 5 minutos...")
+    time.sleep(0.5)  # Ajustado para 0.5 segundo
+    print("Tempo de espera concluído.")
+
+    print("Selecionando 5 minutos de tempo de expiração...")
+    pyautogui.click(x=COORD_5_MINUTOS[0], y=COORD_5_MINUTOS[1])
+    print("Clique realizado.")
+    pyautogui.screenshot('tempo_expiracao.png')
+
+    if acao == "COMPRADO":
+        print(f"**COMPRANDO** {ativo}")
+        pyautogui.click(x=COORD_COMPRAR[0], y=COORD_COMPRAR[1])
+        if reentrada:
+            pyautogui.click(x=COORD_COMPRAR[0], y=COORD_COMPRAR[1])
+        print("Clique de compra realizado.")
+        logging.info(f"**COMPRANDO** {ativo}")
+        pyautogui.screenshot('operacao_compra_realizada.png')
+    elif acao == "VENDIDO":
+        print(f"**VENDENDO** {ativo}")
+        pyautogui.click(x=COORD_VENDER[0], y=COORD_VENDER[1])
+        if reentrada:
+            pyautogui.click(x=COORD_VENDER[0], y=COORD_VENDER[1])
+        print("Clique de venda realizado.")
+        logging.info(f"**VENDENDO** {ativo}")
+        pyautogui.screenshot('operacao_venda_realizada.png')
+
+    # Retorna o timestamp de quando a ação foi executada
+    return time.time()
+
+# --- Função de Processamento de Sinais ---
+def processar_mensagem(mensagem):
+    """Processa as mensagens recebidas do Telegram e as coloca na fila de trades se forem válidas."""
+    print(f"Mensagem recebida: {mensagem}")
+
+    if "⚠️TRADE RÁPIDO⚠️" in mensagem:
+        print("Mensagem de trade rápido detectada!")
+        ativo, acao, hora_entrada, hora_reentrada1, hora_reentrada2 = extrair_informacoes(mensagem)
+
+        if ativo and acao and hora_entrada and hora_reentrada1 and hora_reentrada2:
+            entrada_dt, reentrada1_dt, reentrada2_dt = calcular_tempos(hora_entrada, hora_reentrada1, hora_reentrada2)
+
+            print(f"Sinal de trade recebido: {ativo} - {acao} - {entrada_dt}")
+            logging.info(f"Sinal de trade recebido: {ativo} - {acao} - {entrada_dt}")
+            executar_operacao(ativo, acao, entrada_dt, reentrada1_dt, reentrada2_dt)
+
+        else:
+            print("Mensagem não é um gatilho de operação válido (falha ao extrair informações).")
+    else:
+        print("Mensagem não é um gatilho de operação.")
+
+def executar_operacao(ativo, acao, entrada_dt, reentrada1_dt, reentrada2_dt):
+    """Executa a operação de compra ou venda e as reentradas (com verificação de lucro)."""
+    agora = datetime.now()
+
+    if agora > entrada_dt:
+        print(f"Janela de entrada para {ativo} às {entrada_dt.strftime('%H:%M')} já passou. Operação ignorada.")
+        logging.warning(f"Janela de entrada para {ativo} às {entrada_dt.strftime('%H:%M')} já passou. Operação ignorada.")
+        return
+
+    tempo_ate_entrada = (entrada_dt - agora).total_seconds()
+    if tempo_ate_entrada > 0:
+        print(f"Esperando {tempo_ate_entrada} segundos até a entrada...")
+        time.sleep(tempo_ate_entrada)
+
+    print(f"Executando entrada para {ativo} às {entrada_dt.strftime('%H:%M:%S')}")
+    ativar_janela_avalon()
+
+    valor_banca_inicial = obter_valor_banca()  # Obter valor da banca antes da operação
+
+    # Executa a ação de trade e armazena o timestamp do início da operação
+    inicio_operacao = executar_acao_trade(acao, ativo)
+
+    # Cria e inicia a thread para verificar o resultado
+    verificar_resultado_thread = threading.Thread(target=verificar_resultado, args=(inicio_operacao, valor_banca_inicial, ativo, acao, reentrada1_dt, reentrada2_dt))
+    verificar_resultado_thread.start()
+    verificar_resultado_thread.join() # Aguarda a thread finalizar
+
+
+def verificar_resultado(inicio_operacao, valor_banca_inicial, ativo, acao, reentrada1_dt, reentrada2_dt):
+    """Verifica o resultado da operação, executa reentradas se necessário e verifica o resultado final."""
+
+    # --- Flags de controle ---
+    gale_1_ativo = False
+    gale_2_ativo = False
+    operacao_finalizada = False
+    operacao_atual = "Inicial"
+
+    # --- Timers ---
+    intervalo_verificacao_expiration = 1  # Segundos
+    intervalo_verificacao_status = 0.1  # Segundos
+    ultimo_check_expiration = 0
+    ultimo_check_status = 0
+
+    # --- Monitoramento do tempo e da operação ---
+    while not operacao_finalizada:
+        agora = time.time()
+
+        # --- Verificação do Expiration (a cada 0.1 segundos) ---
+        if agora - ultimo_check_expiration >= intervalo_verificacao_expiration:
+            ultimo_check_expiration = agora
+            x1, y1, x2, y2 = COORD_EXPIRATION_TIMER
+            width = x2 - x1
+            height = y2 - y1
+            screenshot = take_region_screenshot(x1, y1, width, height)
+            tempo_restante = ler_tempo_com_ocr(screenshot)
+            tempo_restante_numerico = ''.join(filter(str.isdigit, tempo_restante))
+            expiration_formatado = f"{int(tempo_restante_numerico[0:2]):02d}{int(tempo_restante_numerico[2:4]):02d}" if len(tempo_restante_numerico) >= 4 else "Erro"
+
+        # --- Verificação do Status (a cada 0.1 segundos) ---
+        if agora - ultimo_check_status >= intervalo_verificacao_status:
+            ultimo_check_status = agora
+            imagem_regiao = obter_regiao_posicao_atual()
+            posicao_atual = extrair_posicao_atual(imagem_regiao)
+
+            if posicao_atual is not None:
+                if acao == "COMPRADO":
+                    em_lucro = posicao_atual["Current Price"] > posicao_atual["Open"]
+                else:  # acao == "VENDIDO"
+                    em_lucro = posicao_atual["Current Price"] < posicao_atual["Open"]
+                status = "em LUCRO" if em_lucro else "em PREJUÍZO"
+            else:
+                status = "Status Indisponível"
+                logging.warning("Não foi possível obter os valores de Open e Current Price.")
+
+        # --- Atualiza a mensagem do terminal (a cada 0.1 segundos) ---
+        #print(f"Ativo: {ativo} | Expiration: {expiration_formatado} | Op atual: {operacao_atual} | Status: {status} | Positions: Current Price: {posicao_atual['Current Price'] if posicao_atual is not None else 'N/A'}, Open: {posicao_atual['Open'] if posicao_atual is not None else 'N/A'}", end="\r")
+        linha = f"Ativo: {ativo} | Expiration: {expiration_formatado} | Op atual: {operacao_atual} | Status: {status} | Positions: Current Price: {posicao_atual['Current Price'] if posicao_atual is not None else 'N/A'}, Open: {posicao_atual['Open'] if posicao_atual is not None else 'N/A'}"
+        subprocess.run(["powershell", "-Command", f"Write-Host '{linha}' -NoNewLine; [console]::setcursorposition(0,[console]::cursorTop)"])
+
+
+        # Verifica se o tempo restante é de 1 segundo e se a operação está em prejuízo
+        if tempo_restante_numerico == "0001" and not em_lucro:
+            if not gale_1_ativo and not gale_2_ativo:
+                print(f"Tempo restante: 1 segundo e operação em prejuízo. Preparando para Gale 1...")
+                logging.info(f"Tempo restante: 1 segundo e operação em prejuízo para {ativo}. Preparando para Gale 1...")
+
+                # --- Aguarda o tempo exato da Reentrada 1 (Gale 1) ---
+                agora = datetime.now()
+                tempo_ate_reentrada1 = (reentrada1_dt - agora).total_seconds()
+                if tempo_ate_reentrada1 > 0:
+                    print(f"Esperando {tempo_ate_reentrada1} segundos até a reentrada 1 (Gale 1)...")
+                    time.sleep(tempo_ate_reentrada1)
+
+                print(f"Executando reentrada 1 (Gale 1) para {ativo} às {reentrada1_dt.strftime('%H:%M:%S')}")
+
+                # --- Executa a Reentrada 1 (Gale 1) - 2 cliques ---
+                executar_acao_trade(acao, ativo, reentrada=True)  # 1 clique
+                executar_acao_trade(acao, ativo, reentrada=True)  # 2 cliques
+                gale_1_ativo = True
+                operacao_atual = "Gale 1"
+
+            elif gale_1_ativo and not gale_2_ativo:
+                print(f"Tempo restante: 1 segundo e operação em prejuízo. Preparando para Gale 2...")
+                logging.info(f"Tempo restante: 1 segundo e operação em prejuízo para {ativo}. Preparando para Gale 2...")
+
+                # --- Aguarda o tempo exato da Reentrada 2 (Gale 2) ---
+                agora = datetime.now()
+                tempo_ate_reentrada2 = (reentrada2_dt - agora).total_seconds()
+                if tempo_ate_reentrada2 > 0:
+                    print(f"Esperando {tempo_ate_reentrada2} segundos até a reentrada 2 (Gale 2)...")
+                    time.sleep(tempo_ate_reentrada2)
+
+                print(f"Executando reentrada 2 (Gale 2) para {ativo} às {reentrada2_dt.strftime('%H:%M:%S')}")
+
+                # --- Executa a Reentrada 2 (Gale 2) - 4 cliques ---
+                executar_acao_trade(acao, ativo, reentrada=True)  # 1 clique
+                executar_acao_trade(acao, ativo, reentrada=True)  # 2 cliques
+                executar_acao_trade(acao, ativo, reentrada=True)  # 3 cliques
+                executar_acao_trade(acao, ativo, reentrada=True)  # 4 cliques
+                gale_2_ativo = True
+                gale_1_ativo = False
+                operacao_atual = "Gale 2"
+
+        elif tempo_restante_numerico == "0001" and em_lucro:
+            if not gale_1_ativo and not gale_2_ativo:
+                print(f"Operação inicial em lucro no último segundo para {ativo}.")
+                logging.info(f"Operação inicial em lucro no último segundo para {ativo}.")
+                operacao_finalizada = True
+            elif gale_1_ativo and not gale_2_ativo:
+                print(f"Operação de Gale 1 em lucro no último segundo para {ativo}.")
+                logging.info(f"Operação de Gale 1 em lucro no último segundo para {ativo}.")
+                operacao_finalizada = True
+            elif gale_2_ativo:
+                print(f"Operação de Gale 2 em lucro no último segundo para {ativo}.")
+                logging.info(f"Operação de Gale 2 em lucro no último segundo para {ativo}.")
+                operacao_finalizada = True
+
+        elif tempo_restante_numerico == "0000":
+            operacao_finalizada = True
+
+        # Aguarda 0.1 segundos antes da próxima iteração
+        time.sleep(0.1)
+
+    # --- Verifica o resultado FINAL da operação (fora do loop while) ---
+    print("Verificando resultado final da operação...")
+    valor_banca_final = obter_valor_banca()  # Obter valor da banca após a operação
+
+    if valor_banca_final is not None:
+        if valor_banca_final > valor_banca_inicial:
+            print(f"Resultado final: Lucro na operação para {ativo}.")
+            logging.info(f"Resultado final: Lucro na operação para {ativo}.")
+        else:
+            print(f"Resultado final: Prejuízo na operação para {ativo}.")
+            logging.info(f"Resultado final: Prejuízo na operação para {ativo}.")
+    else:
+        print(f"Não foi possível obter o valor final da banca para {ativo}.")
+        logging.warning(f"Não foi possível obter o valor final da banca para {ativo}.")
+
+
+    # Cria e inicia a thread para verificar o resultado
+    verificar_resultado_thread = threading.Thread(target=verificar_resultado, args=(inicio_operacao, valor_banca_inicial, ativo, acao, reentrada1_dt, reentrada2_dt))
+    verificar_resultado_thread.start()
+
+# --- Tratador de Eventos do Telegram ---
+@client.on(events.NewMessage(chats=GRUPO_ALVO_ID))
+async def meu_tratador_de_eventos(event):
+    mensagem = event.message.message
+    processar_mensagem(mensagem)
+
+# --- Função Principal ---
+async def main():
+    # Inicia o cliente do Telegram
+    print("Iniciando cliente do Telegram...")
+    await client.start(phone=PHONE_NUMBER)
+
+    if not await client.is_user_authorized():
+        print("Usuário não autorizado. Enviando código de verificação...")
+        await client.send_code_request(PHONE_NUMBER)
+        try:
+            print("Tentando entrar com o código fornecido...")
+            await client.sign_in(PHONE_NUMBER, input('Digite o código: '))
+        except Exception as e:
+            print(f"Erro ao entrar com o código: {e}")
+            print("Tentando entrar com a senha...")
+            await client.sign_in(password=input('Digite a senha: '))
+
+    print("Cliente do Telegram iniciado com sucesso!")
+
+    print("Aguardando mensagens...")
+    await client.run_until_disconnected()
+
+# --- Ponto de Entrada do Script ---
+if __name__ == "__main__":
+    iniciar_avalon()
+    ativar_janela_avalon()
+    with client:
+        try:
+            client.loop.run_until_complete(main())
+        except KeyboardInterrupt:
+            print("Parando o script...")
+            logging.info("Parando o script t...")
+            print("Script parado.")
+            logging.info("Script parado.")
