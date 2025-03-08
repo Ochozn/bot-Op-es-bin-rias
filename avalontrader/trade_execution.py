@@ -41,6 +41,10 @@ def processar_mensagem(mensagem):
 
         if "✅ ENTRADA CONFIRMADA✅" in mensagem:
             print(f"\n{Fore.GREEN}🎯 Sinal de Trade Rápido Detectado!{Style.RESET_ALL}")
+            
+            # Suspende a simulação de atividade assim que detectar sinal válido
+            from avalon_automation import suspender_atividade
+            suspender_atividade()
 
             # Extração de informações com retentativas
             for _ in range(3):
@@ -182,7 +186,7 @@ def executar_operacao(ativo, acao, entrada_dt, expiracao):  # Adicionando parâm
                     ultima_atualizacao = time.time()
 
                 # Verificar condição de saída com controle de execução final
-                if tempo_restante and 1 <= tempo_restante <= 5 and not execucao_final_realizada:
+                if tempo_restante and tempo_restante <= 5 and not execucao_final_realizada:
                     print(f"\n{Fore.BLUE}⏳ Tempo crítico detectado! Aguardando 6s...{Style.RESET_ALL}")
                     execucao_final_realizada = True
                     stop_threads_event.set()
@@ -206,6 +210,10 @@ def executar_operacao(ativo, acao, entrada_dt, expiracao):  # Adicionando parâm
                         shared_posicao["Current Price"] = 0.0
                         shared_tempo_restante["tempo"] = None
 
+                    # Retoma a simulação de atividade após o cálculo final da banca
+                    from avalon_automation import retomar_atividade
+                    retomar_atividade()
+                    
                     voltar_ao_inicio_event.set()
                     break
 

@@ -6,6 +6,13 @@ import pytesseract
 import re
 import logging
 import time
+import os
+
+# Define prints directory path
+PRINTS_DIR = os.path.join(os.path.dirname(__file__), 'prints')
+
+# Ensure prints directory exists
+os.makedirs(PRINTS_DIR, exist_ok=True)
 
 # Configuração do Tesseract
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'

@@ -1,5 +1,10 @@
 import logging
-from avalon_automation import iniciar_avalon, ativar_janela_avalon
+from avalon_automation import (
+    iniciar_avalon, 
+    ativar_janela_avalon, 
+    verificar_necessidade_atividade,  # Add this import
+    simular_atividade  # Add this import too since it's used
+)
 from telegram_client import client, conectar_telegram
 import asyncio
 import threading
@@ -9,7 +14,6 @@ import signal
 import sys
 from datetime import datetime
 import os
-
 
 # --- Inicialização do Colorama ---
 init(autoreset=True)
@@ -36,6 +40,12 @@ def signal_handler(sig, frame):
     stop_threads_event.set()
     os._exit(0)  # Força a saída imediata
 
+async def activity_loop():
+    while not stop_threads_event.is_set():
+        if verificar_necessidade_atividade():
+            simular_atividade()
+        await asyncio.sleep(1)  # Check every second
+
 # --- Função Principal ---
 async def main():
     signal.signal(signal.SIGINT, signal_handler)
@@ -48,6 +58,9 @@ async def main():
 
     # Conecta ao Telegram
     await conectar_telegram()
+
+    # Inicia o loop de atividade em uma tarefa separada
+    activity_task = asyncio.create_task(activity_loop())
 
     # Mantém o script rodando
     print(f"{Fore.CYAN}🔍 Aguardando mensagens...{Style.RESET_ALL}")
@@ -65,6 +78,11 @@ async def main():
         print(f"{Fore.RED}⛔ Erro crítico: {e}{Style.RESET_ALL}")
     finally:
         stop_threads_event.set()
+        activity_task.cancel()  # Cancel the activity task
+        try:
+            await activity_task  # Wait for task to be cancelled
+        except asyncio.CancelledError:
+            pass
         logging.info("Script parado.")
         print(f"\n{Fore.RED}⏹️ Script parado.{Style.RESET_ALL}")
         if client.is_connected():
